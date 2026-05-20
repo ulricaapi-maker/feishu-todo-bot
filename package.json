@@ -1,0 +1,22 @@
+{
+  "name": "feishu-doc-reader",
+  "version": "1.0.0",
+  "description": "Read Feishu documents and manage todos",
+  "main": "bot-server.js",
+  "scripts": {
+    "start": "node bot-server.js",
+    "read": "node read-feishu.js",
+    "todo:add": "node todo.js add",
+    "todo:list": "node todo.js list",
+    "todo:done": "node todo.js done",
+    "todo:clear": "node todo.js clear"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "dotenv": "^17.2.3",
+    "express": "^5.2.1"
+  }
+}
