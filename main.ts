@@ -181,6 +181,37 @@ async function sendFeishuMessage(chatId: string, text: string): Promise<void> {
   }
 }
 
+async function saveChatId(chatId: string): Promise<void> {
+  const kv = await Deno.openKv();
+  await kv.set(["settings", "chatId"], chatId);
+}
+
+async function getSavedChatId(): Promise<string | null> {
+  const kv = await Deno.openKv();
+  const result = await kv.get<string>(["settings", "chatId"]);
+  return result.value || null;
+}
+
+async function sendReminder(): Promise<void> {
+  const chatId = await getSavedChatId();
+
+  if (!chatId) {
+    console.log("还没有保存 chat_id，先在飞书里给机器人发一条消息");
+    return;
+  }
+
+  const list = await formatTodoList();
+
+  if (list === "目前没有待办") {
+    return;
+  }
+
+  await sendFeishuMessage(chatId, "待办提醒：\n" + list);
+}
+
+Deno.cron("morning-todo-reminder", "0 2 * * *", sendReminder);
+Deno.cron("evening-todo-reminder", "30 9 * * *", sendReminder);
+
 async function handleFeishuEvents(request: Request): Promise<Response> {
   const body = await request.json();
 
@@ -193,6 +224,7 @@ async function handleFeishuEvents(request: Request): Promise<Response> {
   const text = getTextFromFeishuMessage(message);
 
   if (chatId && text) {
+    await saveChatId(chatId);
     const reply = await handleText(text);
     await sendFeishuMessage(chatId, reply);
   }
