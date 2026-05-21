@@ -1,3 +1,5 @@
+declare const EdgeRuntime: { waitUntil: (promise: Promise<unknown>) => void };
+
 type Todo = {
   text: string;
   done: boolean;
@@ -212,6 +214,20 @@ async function sendReminder(): Promise<void> {
 Deno.cron("morning-todo-reminder", "0 2 * * *", sendReminder);
 Deno.cron("evening-todo-reminder", "30 9 * * *", sendReminder);
 
+async function processFeishuMessage(body: any): Promise<void> {
+  const message = body.event && body.event.message;
+  const chatId = message && message.chat_id;
+  const text = getTextFromFeishuMessage(message);
+
+  if (!chatId || !text) {
+    return;
+  }
+
+  await saveChatId(chatId);
+  const reply = await handleText(text);
+  await sendFeishuMessage(chatId, reply);
+}
+
 async function handleFeishuEvents(request: Request): Promise<Response> {
   const body = await request.json();
 
@@ -219,15 +235,7 @@ async function handleFeishuEvents(request: Request): Promise<Response> {
     return json({ challenge: body.challenge });
   }
 
-  const message = body.event && body.event.message;
-  const chatId = message && message.chat_id;
-  const text = getTextFromFeishuMessage(message);
-
-  if (chatId && text) {
-    await saveChatId(chatId);
-    const reply = await handleText(text);
-    await sendFeishuMessage(chatId, reply);
-  }
+  EdgeRuntime.waitUntil(processFeishuMessage(body));
 
   return json({ code: 0, msg: "ok" });
 }
