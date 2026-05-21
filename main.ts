@@ -508,7 +508,7 @@ async function interpretNaturalText(text: string): Promise<NaturalIntent | null>
   const intent = outputText ? extractJsonObject(outputText) : null;
 
   if (!intent) {
-    console.log("AI 意图解析没有返回可用 JSON：", outputText || data);
+    console.log("AI 意图解析没有返回可用 JSON：", outputText || "空响应");
   }
 
   return intent;
