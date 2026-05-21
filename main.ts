@@ -356,6 +356,123 @@ async function clearPendingNote(chatId: string): Promise<void> {
   await kv.delete(["pending_note", chatId]);
 }
 
+type NaturalIntent = {
+  action: "add" | "list" | "done" | "delete" | "detail" | "clear" | "start_note" | "cancel_note" | "unknown";
+  text?: string;
+  numbers?: number[];
+};
+
+function extractJsonObject(value: string): NaturalIntent | null {
+  const match = value.match(/\{[\s\S]*\}/);
+
+  if (!match) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(match[0]);
+  } catch (_error) {
+    return null;
+  }
+}
+
+async function interpretNaturalText(text: string): Promise<NaturalIntent | null> {
+  const apiKey = Deno.env.get("OPENAI_API_KEY");
+
+  if (!apiKey || !text.trim()) {
+    return null;
+  }
+
+  const currentTodos = await readTodos();
+  const openTodos = currentTodos
+    .filter((todo) => !todo.done)
+    .map((todo, index) => index + 1 + ". " + todo.text)
+    .join("\n") || "目前没有待办";
+
+  const response = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer " + apiKey,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "gpt-5.4-mini",
+      instructions: [
+        "你是飞书待办机器人的意图解析器，只输出 JSON，不要输出解释。",
+        "把用户中文口语转换为一个动作。",
+        "可选 action: add, list, done, delete, detail, clear, start_note, cancel_note, unknown。",
+        "add 需要 text。done/delete/detail/start_note 需要 numbers 数组。",
+        "如果用户说补充上下文、接下来发聊天记录、把后面的内容补到某几条，用 start_note。",
+        "如果用户只是闲聊或不确定，用 unknown。",
+      ].join("\n"),
+      input: [
+        "当前未完成待办：",
+        openTodos,
+        "",
+        "用户消息：" + text,
+        "",
+        "请输出 JSON，例如：{\"action\":\"add\",\"text\":\"确认 offer 字段\"}",
+      ].join("\n"),
+    }),
+  });
+
+  const data = await response.json();
+
+  if (!response.ok || data.error) {
+    console.log("AI 意图解析失败：", data.error || data);
+    return null;
+  }
+
+  const outputText = data.output_text || data.output?.flatMap((item: any) => item.content || [])
+    ?.map((content: any) => content.text || "")
+    ?.join("\n")
+    ?.trim();
+
+  return outputText ? extractJsonObject(outputText) : null;
+}
+
+async function runNaturalIntent(intent: NaturalIntent, chatId?: string): Promise<string | null> {
+  if (intent.action === "add" && intent.text) {
+    return addTodo(intent.text);
+  }
+
+  if (intent.action === "list") {
+    return formatTodoList();
+  }
+
+  if (intent.action === "clear") {
+    return clearTodos();
+  }
+
+  if (intent.action === "cancel_note") {
+    if (chatId) {
+      await clearPendingNote(chatId);
+    }
+    return "已取消补充";
+  }
+
+  const firstNumber = intent.numbers?.[0];
+
+  if (intent.action === "done" && firstNumber) {
+    return doneTodo(firstNumber);
+  }
+
+  if (intent.action === "delete" && firstNumber) {
+    return deleteTodo(firstNumber);
+  }
+
+  if (intent.action === "detail" && firstNumber) {
+    return formatTodoDetail(firstNumber);
+  }
+
+  if (intent.action === "start_note" && intent.numbers?.length && chatId) {
+    await savePendingNote(chatId, intent.numbers);
+    return "好的，请把要补充的文字或聊天记录发给我。15 分钟内有效；如需取消，发送：取消补充";
+  }
+
+  return null;
+}
+
 async function handleText(text: string, chatId?: string): Promise<string> {
   const trimmed = text.trim();
 
@@ -417,6 +534,16 @@ async function handleText(text: string, chatId?: string): Promise<string> {
     return addTodo(todoText);
   }
 
+  const naturalIntent = await interpretNaturalText(trimmed);
+
+  if (naturalIntent) {
+    const naturalReply = await runNaturalIntent(naturalIntent, chatId);
+
+    if (naturalReply) {
+      return naturalReply;
+    }
+  }
+
   return [
     "我现在支持这些命令：",
     "添加 待办内容",
@@ -449,7 +576,20 @@ async function summarizeFeishuMessage(message: any): Promise<string> {
   const messageType = message?.message_type || "unknown";
 
   try {
-    const content = JSON.parse(message?.content || "{}");
+    let content = JSON.parse(message?.content || "{}");
+    let fullMessage: any | null = null;
+
+    if (["merge_forward", "forward", "chat_history"].includes(messageType)) {
+      fullMessage = await getFeishuMessageContent(messageId);
+
+      if (fullMessage?.body?.content) {
+        try {
+          content = JSON.parse(fullMessage.body.content);
+        } catch (_error) {
+          content = fullMessage.body.content;
+        }
+      }
+    }
 
     if (messageType === "text") {
       const text = content.text || "";
@@ -466,9 +606,17 @@ async function summarizeFeishuMessage(message: any): Promise<string> {
     }
 
     if (["merge_forward", "forward", "chat_history"].includes(messageType)) {
-      const lines = collectReadableText(content);
-      const rawText = lines.join("\n");
-      const aiSummary = await summarizeWithAI("转发聊天记录", rawText);
+      let lines = collectReadableText(content);
+
+      if (fullMessage) {
+        lines = [
+          ...lines,
+          ...collectReadableText(fullMessage),
+        ];
+      }
+
+      const rawText = uniqueLines(lines).join("\n");
+      const aiSummary = await summarizeWithAI("转发聊天记录", rawText || JSON.stringify(content));
       return aiSummary || formatReadableSummary(
         "转发聊天记录摘要",
         lines,
@@ -539,6 +687,34 @@ async function getTenantAccessToken(): Promise<string | null> {
   }
 
   return data.tenant_access_token;
+}
+
+async function getFeishuMessageContent(messageId: string): Promise<any | null> {
+  const token = await getTenantAccessToken();
+
+  if (!token) {
+    return null;
+  }
+
+  const response = await fetch(
+    "https://open.feishu.cn/open-apis/im/v1/messages/" + messageId,
+    {
+      method: "GET",
+      headers: {
+        Authorization: "Bearer " + token,
+        "Content-Type": "application/json; charset=utf-8",
+      },
+    },
+  );
+
+  const data = await response.json();
+
+  if (data.code !== 0) {
+    console.log("获取飞书消息内容失败：", data);
+    return null;
+  }
+
+  return data.data?.items?.[0] || null;
 }
 
 async function sendFeishuMessage(chatId: string, text: string): Promise<void> {
