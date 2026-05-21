@@ -129,6 +129,47 @@ function formatReadableSummary(title: string, lines: string[], fallback: string)
   return output.join("\n");
 }
 
+async function summarizeWithAI(title: string, rawText: string): Promise<string | null> {
+  const apiKey = Deno.env.get("OPENAI_API_KEY");
+
+  if (!apiKey || !rawText.trim()) {
+    return null;
+  }
+
+  const response = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer " + apiKey,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "gpt-5.4-mini",
+      instructions: [
+        "你是一个飞书待办上下文整理助手。",
+        "请把用户转发的聊天记录、富文本、文件说明或普通文字整理成简短中文摘要。",
+        "输出要适合作为待办事项的上下文，不要寒暄，不要编造。",
+        "如果能看出行动项、负责人、截止时间、字段名、争议点，请优先提取。",
+        "最多 5 条，每条不超过 40 个中文字符。",
+      ].join("\n"),
+      input: "标题：" + title + "\n\n原始内容：\n" + truncate(rawText, 6000),
+    }),
+  });
+
+  const data = await response.json();
+
+  if (!response.ok || data.error) {
+    console.log("AI 摘要失败：", data.error || data);
+    return null;
+  }
+
+  const text = data.output_text || data.output?.flatMap((item: any) => item.content || [])
+    ?.map((content: any) => content.text || "")
+    ?.join("\n")
+    ?.trim();
+
+  return text ? "AI 摘要：\n" + text : null;
+}
+
 function flattenPostContent(value: unknown): string[] {
   return collectReadableText(value);
 }
@@ -405,7 +446,7 @@ function getTextFromFeishuMessage(message: any): string {
   }
 }
 
-function summarizeFeishuMessage(message: any): string {
+async function summarizeFeishuMessage(message: any): Promise<string> {
   const messageId = message?.message_id || "未知 message_id";
   const messageType = message?.message_type || "unknown";
 
@@ -413,18 +454,26 @@ function summarizeFeishuMessage(message: any): string {
     const content = JSON.parse(message?.content || "{}");
 
     if (messageType === "text") {
-      return content.text || "";
+      const text = content.text || "";
+      const aiSummary = await summarizeWithAI("普通文字", text);
+      return aiSummary || text;
     }
 
     if (messageType === "post") {
-      const title = content.title ? "富文本摘要 - " + content.title : "富文本摘要";
-      return formatReadableSummary(title, collectReadableText(content.content), "收到一条富文本消息");
+      const title = content.title ? "富文本 - " + content.title : "富文本";
+      const lines = collectReadableText(content.content);
+      const rawText = lines.join("\n");
+      const aiSummary = await summarizeWithAI(title, rawText);
+      return aiSummary || formatReadableSummary("富文本摘要", lines, "收到一条富文本消息");
     }
 
     if (["merge_forward", "forward", "chat_history"].includes(messageType)) {
-      return formatReadableSummary(
+      const lines = collectReadableText(content);
+      const rawText = lines.join("\n");
+      const aiSummary = await summarizeWithAI("转发聊天记录", rawText);
+      return aiSummary || formatReadableSummary(
         "转发聊天记录摘要",
-        collectReadableText(content),
+        lines,
         "收到一条转发聊天记录。\nmessage_id: " + messageId,
       );
     }
@@ -435,16 +484,20 @@ function summarizeFeishuMessage(message: any): string {
 
     if (messageType === "file") {
       const name = content.file_name || content.name || "未命名文件";
-      return "文件上下文：" + name + "。\nmessage_id: " + messageId;
+      const aiSummary = await summarizeWithAI("文件", JSON.stringify(content));
+      return aiSummary || "文件上下文：" + name + "。\nmessage_id: " + messageId;
     }
 
     if (messageType === "audio") {
       return "语音上下文：收到一条语音消息。\nmessage_id: " + messageId;
     }
 
-    return formatReadableSummary(
+    const lines = collectReadableText(content);
+    const rawText = lines.join("\n") || JSON.stringify(content);
+    const aiSummary = await summarizeWithAI("消息类型：" + messageType, rawText);
+    return aiSummary || formatReadableSummary(
       "消息摘要（" + messageType + "）",
-      collectReadableText(content),
+      lines,
       "收到一条「" + messageType + "」消息。\nmessage_id: " + messageId,
     );
   } catch (_error) {
@@ -578,7 +631,7 @@ async function processFeishuMessage(body: any): Promise<void> {
   }
 
   if (pending) {
-    const note = summarizeFeishuMessage(message);
+    const note = await summarizeFeishuMessage(message);
     const reply = await addNotes(pending.numbers, note);
     await clearPendingNote(chatId);
     await sendFeishuMessage(chatId, reply);
