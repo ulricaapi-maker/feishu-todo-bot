@@ -16,6 +16,8 @@ type PendingNote = {
   createdAt: string;
 };
 
+const FORWARD_MESSAGE_TYPES = ["merge_forward", "forward", "chat_history"];
+
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
     status,
@@ -23,10 +25,22 @@ function json(data: unknown, status = 200): Response {
   });
 }
 
+function parseMaybeJson(value: unknown): unknown {
+  if (typeof value !== "string") {
+    return value;
+  }
+
+  try {
+    return JSON.parse(value);
+  } catch (_error) {
+    return value;
+  }
+}
+
 function parseTodoNumbers(value: string): number[] {
   return value
     .split(/[，,、\s]+/)
-    .map((item) => Number(item.trim()))
+    .map((item) => parseChineseNumber(item.trim()) || Number(item.trim()))
     .filter((item) => Number.isInteger(item) && item > 0);
 }
 
@@ -108,6 +122,49 @@ function uniqueLines(lines: string[]): string[] {
   });
 
   return result;
+}
+
+function messageItemToReadableLines(item: any): string[] {
+  const messageType = item?.msg_type || item?.message_type || item?.body?.msg_type || "unknown";
+  const sender =
+    item?.sender?.sender_id?.user_id ||
+    item?.sender?.sender_id?.open_id ||
+    item?.sender?.id ||
+    item?.sender?.name ||
+    "";
+  const rawContent = item?.body?.content || item?.content || item?.message?.content;
+  const content = parseMaybeJson(rawContent);
+  const lines = uniqueLines(collectReadableText(content));
+
+  if (lines.length === 0) {
+    return [];
+  }
+
+  const prefix = sender ? sender + "：" : "";
+
+  if (messageType === "image") {
+    return [prefix + "[图片]"];
+  }
+
+  return lines.map((line) => prefix + line);
+}
+
+function extractForwardMessageLines(fullMessage: any): string[] {
+  const items = Array.isArray(fullMessage?.items)
+    ? fullMessage.items
+    : Array.isArray(fullMessage?.data?.items)
+      ? fullMessage.data.items
+      : Array.isArray(fullMessage)
+        ? fullMessage
+        : [];
+
+  const lines = items.flatMap((item: any) => messageItemToReadableLines(item));
+
+  if (lines.length > 0) {
+    return uniqueLines(lines);
+  }
+
+  return uniqueLines(collectReadableText(fullMessage));
 }
 
 function formatReadableSummary(title: string, lines: string[], fallback: string): string {
@@ -473,6 +530,73 @@ async function runNaturalIntent(intent: NaturalIntent, chatId?: string): Promise
   return null;
 }
 
+function parseChineseNumber(value: string): number | null {
+  const normalized = value.trim();
+  const digit = normalized.match(/\d+/);
+
+  if (digit) {
+    return Number(digit[0]);
+  }
+
+  const map: Record<string, number> = {
+    一: 1,
+    二: 2,
+    两: 2,
+    三: 3,
+    四: 4,
+    五: 5,
+    六: 6,
+    七: 7,
+    八: 8,
+    九: 9,
+    十: 10,
+  };
+
+  return map[normalized] || null;
+}
+
+function parseNaturalFallback(text: string): NaturalIntent | null {
+  const trimmed = text.trim();
+
+  if (/^(看一下)?(待办)?(列表|清单)$/.test(trimmed) || /还有(哪些|什么).*待办/.test(trimmed)) {
+    return { action: "list" };
+  }
+
+  if (/^(取消补充|不补充了|算了)$/.test(trimmed)) {
+    return { action: "cancel_note" };
+  }
+
+  const noteMatch = trimmed.match(/(?:补充|作为上下文|聊天记录|下一条|后面).*(?:第?\s*([\d一二两三四五六七八九十，,、\s]+)\s*(?:条|个)?)/);
+  if (noteMatch) {
+    return { action: "start_note", numbers: parseTodoNumbers(noteMatch[1]) };
+  }
+
+  const doneMatch = trimmed.match(/(?:第?\s*([\d一二两三四五六七八九十]+)\s*(?:条|个)?).*(?:完成|做完|搞定|处理完)/);
+  if (doneMatch) {
+    const number = parseChineseNumber(doneMatch[1]);
+    return number ? { action: "done", numbers: [number] } : null;
+  }
+
+  const deleteMatch = trimmed.match(/(?:删掉|删除|去掉).*(?:第?\s*([\d一二两三四五六七八九十]+)\s*(?:条|个)?)/);
+  if (deleteMatch) {
+    const number = parseChineseNumber(deleteMatch[1]);
+    return number ? { action: "delete", numbers: [number] } : null;
+  }
+
+  const detailMatch = trimmed.match(/(?:详情|看看|看下|看一下).*(?:第?\s*([\d一二两三四五六七八九十]+)\s*(?:条|个)?)/);
+  if (detailMatch) {
+    const number = parseChineseNumber(detailMatch[1]);
+    return number ? { action: "detail", numbers: [number] } : null;
+  }
+
+  const addMatch = trimmed.match(/^(?:帮我)?(?:记一下|记录一下|加一个待办|添加待办|待办|提醒我|要处理|需要跟进)\s*[：:]?\s*(.+)$/);
+  if (addMatch?.[1]?.trim()) {
+    return { action: "add", text: addMatch[1].trim() };
+  }
+
+  return null;
+}
+
 async function handleText(text: string, chatId?: string): Promise<string> {
   const trimmed = text.trim();
 
@@ -534,6 +658,16 @@ async function handleText(text: string, chatId?: string): Promise<string> {
     return addTodo(todoText);
   }
 
+  const fallbackIntent = parseNaturalFallback(trimmed);
+
+  if (fallbackIntent) {
+    const fallbackReply = await runNaturalIntent(fallbackIntent, chatId);
+
+    if (fallbackReply) {
+      return fallbackReply;
+    }
+  }
+
   const naturalIntent = await interpretNaturalText(trimmed);
 
   if (naturalIntent) {
@@ -576,51 +710,64 @@ async function summarizeFeishuMessage(message: any): Promise<string> {
   const messageType = message?.message_type || "unknown";
 
   try {
-    let content = JSON.parse(message?.content || "{}");
+    let content = parseMaybeJson(message?.content || "{}");
     let fullMessage: any | null = null;
 
-    if (["merge_forward", "forward", "chat_history"].includes(messageType)) {
+    if (FORWARD_MESSAGE_TYPES.includes(messageType)) {
       fullMessage = await getFeishuMessageContent(messageId);
 
       if (fullMessage?.body?.content) {
-        try {
-          content = JSON.parse(fullMessage.body.content);
-        } catch (_error) {
-          content = fullMessage.body.content;
-        }
+        content = parseMaybeJson(fullMessage.body.content);
       }
     }
 
     if (messageType === "text") {
-      const text = content.text || "";
+      const text = typeof content === "object" && content && "text" in content
+        ? String((content as Record<string, unknown>).text || "")
+        : "";
       const aiSummary = await summarizeWithAI("普通文字", text);
       return aiSummary || text;
     }
 
     if (messageType === "post") {
-      const title = content.title ? "富文本 - " + content.title : "富文本";
-      const lines = collectReadableText(content.content);
+      const postContent = typeof content === "object" && content ? content as Record<string, unknown> : {};
+      const title = postContent.title ? "富文本 - " + String(postContent.title) : "富文本";
+      const lines = collectReadableText(postContent.content);
       const rawText = lines.join("\n");
       const aiSummary = await summarizeWithAI(title, rawText);
       return aiSummary || formatReadableSummary("富文本摘要", lines, "收到一条富文本消息");
     }
 
-    if (["merge_forward", "forward", "chat_history"].includes(messageType)) {
+    if (FORWARD_MESSAGE_TYPES.includes(messageType)) {
       let lines = collectReadableText(content);
 
       if (fullMessage) {
         lines = [
           ...lines,
-          ...collectReadableText(fullMessage),
+          ...extractForwardMessageLines(fullMessage),
         ];
       }
 
       const rawText = uniqueLines(lines).join("\n");
-      const aiSummary = await summarizeWithAI("转发聊天记录", rawText || JSON.stringify(content));
+      const aiSummary = await summarizeWithAI("转发聊天记录", rawText || JSON.stringify(content || {}));
+
+      if (!rawText.trim()) {
+        console.log("转发消息没有解析到正文：", {
+          messageId,
+          messageType,
+          content,
+          fullMessageKeys: fullMessage ? Object.keys(fullMessage) : [],
+        });
+      }
+
       return aiSummary || formatReadableSummary(
         "转发聊天记录摘要",
         lines,
-        "收到一条转发聊天记录。\nmessage_id: " + messageId,
+        [
+          "收到一条转发聊天记录，但飞书这次没有把正文开放给机器人。",
+          "message_id: " + messageId,
+          "可以改用：复制聊天文字后发送，或把单条消息逐条转发给我。",
+        ].join("\n"),
       );
     }
 
@@ -629,7 +776,8 @@ async function summarizeFeishuMessage(message: any): Promise<string> {
     }
 
     if (messageType === "file") {
-      const name = content.file_name || content.name || "未命名文件";
+      const fileContent = typeof content === "object" && content ? content as Record<string, unknown> : {};
+      const name = fileContent.file_name || fileContent.name || "未命名文件";
       const aiSummary = await summarizeWithAI("文件", JSON.stringify(content));
       return aiSummary || "文件上下文：" + name + "。\nmessage_id: " + messageId;
     }
@@ -714,7 +862,7 @@ async function getFeishuMessageContent(messageId: string): Promise<any | null> {
     return null;
   }
 
-  return data.data?.items?.[0] || null;
+  return data.data || null;
 }
 
 async function sendFeishuMessage(chatId: string, text: string): Promise<void> {
