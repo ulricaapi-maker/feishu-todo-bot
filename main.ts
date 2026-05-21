@@ -59,6 +59,21 @@ function cleanSummaryText(value: string): string {
     .trim();
 }
 
+function cleanUserVisibleText(value: string): string {
+  return value
+    .split("\n")
+    .map((line) => line
+      .replace(/message_id:\s*\S+/gi, "")
+      .replace(/\bou_[a-z0-9]+：?\s*/gi, "")
+      .replace(/Merged and Forwarded Message/gi, "")
+      .replace(/收到一条「merge_forward」消息。?/g, "")
+      .replace(/收到一条转发聊天记录，但飞书这次没有把正文开放给机器人。?/g, "")
+      .trim())
+    .filter((line) => line && !/^\d+\.\s*$/.test(line))
+    .join("\n")
+    .trim();
+}
+
 function collectReadableText(value: unknown, depth = 0): string[] {
   if (!value || depth > 8) {
     return [];
@@ -186,7 +201,8 @@ function formatReadableSummary(title: string, lines: string[], fallback: string)
 
 async function callAI(systemPrompt: string, userPrompt: string): Promise<string | null> {
   const deepseekKey = Deno.env.get("DEEPSEEK_API_KEY");
-  const openaiKey = Deno.env.get("OPENAI_API_KEY");
+  const allowOpenaiFallback = Deno.env.get("ALLOW_OPENAI_FALLBACK") === "true";
+  const openaiKey = allowOpenaiFallback ? Deno.env.get("OPENAI_API_KEY") : "";
 
   if (deepseekKey) {
     const response = await fetch("https://api.deepseek.com/chat/completions", {
@@ -216,7 +232,7 @@ async function callAI(systemPrompt: string, userPrompt: string): Promise<string 
   }
 
   if (!openaiKey) {
-    console.log("AI 未启用：缺少 DEEPSEEK_API_KEY 或 OPENAI_API_KEY");
+    console.log("AI 未启用：缺少 DEEPSEEK_API_KEY");
     return null;
   }
 
@@ -414,7 +430,8 @@ async function formatTodoDetail(number: number): Promise<string> {
 
   lines.push("上下文：");
   todo.notes.forEach((note, index) => {
-    lines.push(index + 1 + ". " + note.text);
+    const cleanText = cleanUserVisibleText(note.text);
+    lines.push(index + 1 + ". " + (cleanText || "这条上下文没有可展示的正文"));
   });
 
   return lines.join("\n");
@@ -429,7 +446,10 @@ async function summarizeTodo(number: number): Promise<string> {
     return "没有找到这个编号的待办";
   }
 
-  const noteText = todo.notes?.map((note, index) => index + 1 + ". " + note.text).join("\n") || "";
+  const noteText = todo.notes
+    ?.map((note, index) => index + 1 + ". " + cleanUserVisibleText(note.text))
+    .filter((line) => line.trim() && !line.endsWith(". "))
+    .join("\n") || "";
 
   if (!noteText.trim()) {
     return "这个待办还没有补充上下文，我只能看到标题：" + todo.text;
@@ -445,7 +465,10 @@ async function summarizeTodo(number: number): Promise<string> {
     ].join("\n"),
   );
 
-  return summary || formatTodoDetail(number);
+  return summary || [
+    "我先按现有上下文粗略整理：",
+    noteText || "目前没有可读正文，只有转发消息记录。",
+  ].join("\n");
 }
 
 async function clearTodos(): Promise<string> {
