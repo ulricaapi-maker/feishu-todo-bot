@@ -184,29 +184,52 @@ function formatReadableSummary(title: string, lines: string[], fallback: string)
   return output.join("\n");
 }
 
-async function summarizeWithAI(title: string, rawText: string): Promise<string | null> {
-  const apiKey = Deno.env.get("OPENAI_API_KEY");
+async function callAI(systemPrompt: string, userPrompt: string): Promise<string | null> {
+  const deepseekKey = Deno.env.get("DEEPSEEK_API_KEY");
+  const openaiKey = Deno.env.get("OPENAI_API_KEY");
 
-  if (!apiKey || !rawText.trim()) {
+  if (deepseekKey) {
+    const response = await fetch("https://api.deepseek.com/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer " + deepseekKey,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "deepseek-chat",
+        temperature: 0.2,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
+      }),
+    });
+
+    const data = await response.json();
+
+    if (!response.ok || data.error) {
+      console.log("DeepSeek 调用失败：", data.error || data);
+      return null;
+    }
+
+    return data.choices?.[0]?.message?.content?.trim() || null;
+  }
+
+  if (!openaiKey) {
+    console.log("AI 未启用：缺少 DEEPSEEK_API_KEY 或 OPENAI_API_KEY");
     return null;
   }
 
   const response = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: {
-      Authorization: "Bearer " + apiKey,
+      Authorization: "Bearer " + openaiKey,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
       model: "gpt-5.4-mini",
-      instructions: [
-        "你是一个飞书待办上下文整理助手。",
-        "请把用户转发的聊天记录、富文本、文件说明或普通文字整理成简短中文摘要。",
-        "输出要适合作为待办事项的上下文，不要寒暄，不要编造。",
-        "如果能看出行动项、负责人、截止时间、字段名、争议点，请优先提取。",
-        "最多 5 条，每条不超过 40 个中文字符。",
-      ].join("\n"),
-      input: "标题：" + title + "\n\n原始内容：\n" + truncate(rawText, 6000),
+      instructions: systemPrompt,
+      input: userPrompt,
     }),
   });
 
@@ -217,10 +240,27 @@ async function summarizeWithAI(title: string, rawText: string): Promise<string |
     return null;
   }
 
-  const text = data.output_text || data.output?.flatMap((item: any) => item.content || [])
+  return data.output_text || data.output?.flatMap((item: any) => item.content || [])
     ?.map((content: any) => content.text || "")
     ?.join("\n")
-    ?.trim();
+    ?.trim() || null;
+}
+
+async function summarizeWithAI(title: string, rawText: string): Promise<string | null> {
+  if (!rawText.trim()) {
+    return null;
+  }
+
+  const text = await callAI(
+    [
+      "你是一个飞书待办上下文整理助手。",
+      "请把用户转发的聊天记录、富文本、文件说明或普通文字整理成简短中文摘要。",
+      "输出要适合作为待办事项的上下文，不要寒暄，不要编造。",
+      "如果能看出行动项、负责人、截止时间、字段名、争议点，请优先提取。",
+      "最多 5 条，每条不超过 40 个中文字符。",
+    ].join("\n"),
+    "标题：" + title + "\n\n原始内容：\n" + truncate(rawText, 6000),
+  );
 
   return text ? "AI 摘要：\n" + text : null;
 }
@@ -434,12 +474,7 @@ function extractJsonObject(value: string): NaturalIntent | null {
 }
 
 async function interpretNaturalText(text: string): Promise<NaturalIntent | null> {
-  const apiKey = Deno.env.get("OPENAI_API_KEY");
-
-  if (!apiKey || !text.trim()) {
-    if (!apiKey) {
-      console.log("AI 意图解析未启用：缺少 OPENAI_API_KEY");
-    }
+  if (!text.trim()) {
     return null;
   }
 
@@ -449,44 +484,26 @@ async function interpretNaturalText(text: string): Promise<NaturalIntent | null>
     .map((todo, index) => index + 1 + ". " + todo.text)
     .join("\n") || "目前没有待办";
 
-  const response = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      Authorization: "Bearer " + apiKey,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "gpt-5.4-mini",
-      instructions: [
-        "你是飞书待办机器人的意图解析器，只输出 JSON，不要输出解释。",
-        "把用户中文口语转换为一个动作。",
-        "可选 action: add, list, done, delete, detail, clear, start_note, cancel_note, unknown。",
-        "add 需要 text。done/delete/detail/start_note 需要 numbers 数组。",
-        "如果用户说补充上下文、接下来发聊天记录、把后面的内容补到某几条，用 start_note。",
-        "如果用户只是闲聊或不确定，用 unknown。",
-      ].join("\n"),
-      input: [
-        "当前未完成待办：",
-        openTodos,
-        "",
-        "用户消息：" + text,
-        "",
-        "请输出 JSON，例如：{\"action\":\"add\",\"text\":\"确认 offer 字段\"}",
-      ].join("\n"),
-    }),
-  });
-
-  const data = await response.json();
-
-  if (!response.ok || data.error) {
-    console.log("AI 意图解析失败：", data.error || data);
-    return null;
-  }
-
-  const outputText = data.output_text || data.output?.flatMap((item: any) => item.content || [])
-    ?.map((content: any) => content.text || "")
-    ?.join("\n")
-    ?.trim();
+  const outputText = await callAI(
+    [
+      "你是飞书待办机器人的意图解析器，只输出 JSON，不要输出解释。",
+      "把用户中文口语转换为一个动作。",
+      "可选 action: add, list, done, delete, detail, clear, start_note, cancel_note, unknown。",
+      "add 需要 text。",
+      "done/delete/detail/start_note 需要 numbers 数组。",
+      "如果用户说总结、整理、分析某个已有待办，优先用 detail，并填 numbers。",
+      "如果用户说补充上下文、接下来发聊天记录、把后面的内容补到某几条，用 start_note。",
+      "如果用户只是闲聊或不确定，用 unknown。",
+    ].join("\n"),
+    [
+      "当前未完成待办：",
+      openTodos,
+      "",
+      "用户消息：" + text,
+      "",
+      "请输出 JSON，例如：{\"action\":\"detail\",\"numbers\":[1]}",
+    ].join("\n"),
+  );
 
   const intent = outputText ? extractJsonObject(outputText) : null;
 
