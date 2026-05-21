@@ -1,5 +1,3 @@
-declare const EdgeRuntime: { waitUntil: (promise: Promise<unknown>) => void };
-
 type TodoNote = {
   text: string;
   createdAt: string;
@@ -654,7 +652,7 @@ async function handleFeishuEvents(request: Request): Promise<Response> {
     return json({ challenge: body.challenge });
   }
 
-  EdgeRuntime.waitUntil(processFeishuMessage(body));
+  await processFeishuMessage(body);
 
   return json({ code: 0, msg: "ok" });
 }
