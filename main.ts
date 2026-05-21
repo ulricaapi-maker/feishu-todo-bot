@@ -40,43 +40,97 @@ function truncate(value: string, maxLength = 800): string {
   return value.slice(0, maxLength) + "...";
 }
 
-function flattenPostContent(value: unknown): string[] {
-  if (!value) {
+function cleanSummaryText(value: string): string {
+  return value
+    .replace(/\s+/g, " ")
+    .replace(/\{.*?\}/g, "")
+    .trim();
+}
+
+function collectReadableText(value: unknown, depth = 0): string[] {
+  if (!value || depth > 8) {
     return [];
   }
 
   if (typeof value === "string") {
-    return [value];
+    const text = cleanSummaryText(value);
+    return text ? [text] : [];
   }
 
   if (Array.isArray(value)) {
-    return value.flatMap((item) => flattenPostContent(item));
+    return value.flatMap((item) => collectReadableText(item, depth + 1));
   }
 
   if (typeof value === "object") {
     const item = value as Record<string, unknown>;
     const texts: string[] = [];
+    const usefulKeys = [
+      "title",
+      "text",
+      "name",
+      "summary",
+      "description",
+      "content",
+      "body",
+      "elements",
+      "items",
+      "messages",
+      "message",
+      "sender",
+      "user_name",
+      "href",
+      "url",
+    ];
 
-    if (typeof item.text === "string") {
-      texts.push(item.text);
-    }
-
-    if (typeof item.name === "string") {
-      texts.push(item.name);
-    }
-
-    if (typeof item.href === "string") {
-      texts.push(item.href);
-    }
-
-    if (item.content) {
-      texts.push(...flattenPostContent(item.content));
-    }
+    usefulKeys.forEach((key) => {
+      if (key in item) {
+        texts.push(...collectReadableText(item[key], depth + 1));
+      }
+    });
 
     return texts;
   }
 
   return [];
+}
+
+function uniqueLines(lines: string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+
+  lines.forEach((line) => {
+    const text = cleanSummaryText(line);
+
+    if (!text || seen.has(text)) {
+      return;
+    }
+
+    seen.add(text);
+    result.push(text);
+  });
+
+  return result;
+}
+
+function formatReadableSummary(title: string, lines: string[], fallback: string): string {
+  const cleanLines = uniqueLines(lines)
+    .filter((line) => line.length > 1)
+    .slice(0, 8);
+
+  if (cleanLines.length === 0) {
+    return fallback;
+  }
+
+  const output = [title + "："];
+  cleanLines.forEach((line, index) => {
+    output.push(index + 1 + ". " + truncate(line, 160));
+  });
+
+  return output.join("\n");
+}
+
+function flattenPostContent(value: unknown): string[] {
+  return collectReadableText(value);
 }
 
 async function getKv(): Promise<Deno.Kv> {
@@ -363,13 +417,36 @@ function summarizeFeishuMessage(message: any): string {
     }
 
     if (messageType === "post") {
-      const title = content.title ? "标题：" + content.title + "\n" : "";
-      const text = flattenPostContent(content.content).join(" ").trim();
-      return title + (text || "收到一条富文本消息") + "\nmessage_id: " + messageId;
+      const title = content.title ? "富文本摘要 - " + content.title : "富文本摘要";
+      return formatReadableSummary(title, collectReadableText(content.content), "收到一条富文本消息");
     }
 
-    const raw = truncate(JSON.stringify(content));
-    return "收到一条「" + messageType + "」消息。\nmessage_id: " + messageId + "\n内容摘要：" + raw;
+    if (["merge_forward", "forward", "chat_history"].includes(messageType)) {
+      return formatReadableSummary(
+        "转发聊天记录摘要",
+        collectReadableText(content),
+        "收到一条转发聊天记录。\nmessage_id: " + messageId,
+      );
+    }
+
+    if (messageType === "image") {
+      return "图片上下文：收到一张图片。\nmessage_id: " + messageId;
+    }
+
+    if (messageType === "file") {
+      const name = content.file_name || content.name || "未命名文件";
+      return "文件上下文：" + name + "。\nmessage_id: " + messageId;
+    }
+
+    if (messageType === "audio") {
+      return "语音上下文：收到一条语音消息。\nmessage_id: " + messageId;
+    }
+
+    return formatReadableSummary(
+      "消息摘要（" + messageType + "）",
+      collectReadableText(content),
+      "收到一条「" + messageType + "」消息。\nmessage_id: " + messageId,
+    );
   } catch (_error) {
     return "收到一条「" + messageType + "」消息。\nmessage_id: " + messageId;
   }
