@@ -71,6 +71,21 @@ async function doneTodo(number: number): Promise<string> {
   return "已完成：" + todo.text;
 }
 
+async function deleteTodo(number: number): Promise<string> {
+  const todos = await readTodos();
+  const openTodos = todos.filter((todo) => !todo.done);
+  const todo = openTodos[number - 1];
+
+  if (!todo) {
+    return "没有找到这个编号的待办";
+  }
+
+  const nextTodos = todos.filter((item) => item !== todo);
+  await writeTodos(nextTodos);
+
+  return "已删除：" + todo.text;
+}
+
 async function clearTodos(): Promise<string> {
   const todos = await readTodos();
 
@@ -101,6 +116,11 @@ async function handleText(text: string): Promise<string> {
     return doneTodo(number);
   }
 
+  if (trimmed.startsWith("删除 ")) {
+    const number = Number(trimmed.replace("删除 ", ""));
+    return deleteTodo(number);
+  }
+
   if (trimmed.startsWith("添加 ")) {
     const todoText = trimmed.replace("添加 ", "");
     return addTodo(todoText);
@@ -111,6 +131,7 @@ async function handleText(text: string): Promise<string> {
     "添加 待办内容",
     "列表",
     "完成 1",
+    "删除 1",
     "清空",
   ].join("\n");
 }
