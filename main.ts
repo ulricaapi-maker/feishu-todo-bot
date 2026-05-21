@@ -420,6 +420,34 @@ async function formatTodoDetail(number: number): Promise<string> {
   return lines.join("\n");
 }
 
+async function summarizeTodo(number: number): Promise<string> {
+  const todos = await readTodos();
+  const openTodos = todos.filter((todo) => !todo.done);
+  const todo = openTodos[number - 1];
+
+  if (!todo) {
+    return "没有找到这个编号的待办";
+  }
+
+  const noteText = todo.notes?.map((note, index) => index + 1 + ". " + note.text).join("\n") || "";
+
+  if (!noteText.trim()) {
+    return "这个待办还没有补充上下文，我只能看到标题：" + todo.text;
+  }
+
+  const summary = await summarizeWithAI(
+    "待办：" + todo.text,
+    [
+      "待办标题：" + todo.text,
+      "",
+      "上下文：",
+      noteText,
+    ].join("\n"),
+  );
+
+  return summary || formatTodoDetail(number);
+}
+
 async function clearTodos(): Promise<string> {
   const todos = await readTodos();
 
@@ -454,7 +482,7 @@ async function clearPendingNote(chatId: string): Promise<void> {
 }
 
 type NaturalIntent = {
-  action: "add" | "list" | "done" | "delete" | "detail" | "clear" | "start_note" | "cancel_note" | "unknown";
+  action: "add" | "list" | "done" | "delete" | "detail" | "summarize" | "clear" | "start_note" | "cancel_note" | "unknown";
   text?: string;
   numbers?: number[];
 };
@@ -488,10 +516,10 @@ async function interpretNaturalText(text: string): Promise<NaturalIntent | null>
     [
       "你是飞书待办机器人的意图解析器，只输出 JSON，不要输出解释。",
       "把用户中文口语转换为一个动作。",
-      "可选 action: add, list, done, delete, detail, clear, start_note, cancel_note, unknown。",
+      "可选 action: add, list, done, delete, detail, summarize, clear, start_note, cancel_note, unknown。",
       "add 需要 text。",
-      "done/delete/detail/start_note 需要 numbers 数组。",
-      "如果用户说总结、整理、分析某个已有待办，优先用 detail，并填 numbers。",
+      "done/delete/detail/summarize/start_note 需要 numbers 数组。",
+      "如果用户说总结、整理、分析某个已有待办，用 summarize，并填 numbers。",
       "如果用户说补充上下文、接下来发聊天记录、把后面的内容补到某几条，用 start_note。",
       "如果用户只是闲聊或不确定，用 unknown。",
     ].join("\n"),
@@ -548,6 +576,10 @@ async function runNaturalIntent(intent: NaturalIntent, chatId?: string): Promise
     return formatTodoDetail(firstNumber);
   }
 
+  if (intent.action === "summarize" && firstNumber) {
+    return summarizeTodo(firstNumber);
+  }
+
   if (intent.action === "start_note" && intent.numbers?.length && chatId) {
     await savePendingNote(chatId, intent.numbers);
     return "好的，请把要补充的文字或聊天记录发给我。15 分钟内有效；如需取消，发送：取消补充";
@@ -588,9 +620,50 @@ function findTodoNumbersInText(text: string): number[] {
     .filter((item): item is number => Boolean(item));
 }
 
-function parseNaturalFallback(text: string): NaturalIntent | null {
+function normalizeForMatch(value: string): string {
+  return value.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+}
+
+async function findTodoNumberByText(text: string): Promise<number | null> {
+  const todos = await readTodos();
+  const openTodos = todos.filter((todo) => !todo.done);
+  const normalizedText = normalizeForMatch(text);
+
+  let bestNumber: number | null = null;
+  let bestScore = 0;
+
+  openTodos.forEach((todo, index) => {
+    const normalizedTodo = normalizeForMatch(todo.text);
+
+    if (!normalizedTodo) {
+      return;
+    }
+
+    let score = 0;
+
+    if (normalizedText.includes(normalizedTodo)) {
+      score += normalizedTodo.length + 10;
+    }
+
+    normalizedTodo.match(/[\p{L}\p{N}]{2,}/gu)?.forEach((part) => {
+      if (normalizedText.includes(part)) {
+        score += part.length;
+      }
+    });
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestNumber = index + 1;
+    }
+  });
+
+  return bestScore >= 2 ? bestNumber : null;
+}
+
+async function parseNaturalFallback(text: string): Promise<NaturalIntent | null> {
   const trimmed = text.trim();
   const numbers = findTodoNumbersInText(trimmed);
+  const matchedNumber = numbers[0] || await findTodoNumberByText(trimmed);
 
   if (
     /^(看一下|看下)?(待办)?(列表|清单)$/.test(trimmed) ||
@@ -604,20 +677,24 @@ function parseNaturalFallback(text: string): NaturalIntent | null {
     return { action: "cancel_note" };
   }
 
-  if (/(补充|上下文|聊天记录|对话|下一条|后面|转发)/.test(trimmed) && numbers.length > 0) {
-    return { action: "start_note", numbers };
+  if (/(总结|整理|分析|复盘|归纳|智能总结)/.test(trimmed) && matchedNumber) {
+    return { action: "summarize", numbers: [matchedNumber] };
   }
 
-  if (/(完成|做完|搞定|处理完|办完|结束|关掉)/.test(trimmed) && numbers.length > 0) {
-    return { action: "done", numbers: [numbers[0]] };
+  if (/(补充|上下文|聊天记录|对话|下一条|后面|转发)/.test(trimmed) && matchedNumber) {
+    return { action: "start_note", numbers: [matchedNumber] };
   }
 
-  if (/(删掉|删除|去掉|移除|不要了)/.test(trimmed) && numbers.length > 0) {
-    return { action: "delete", numbers: [numbers[0]] };
+  if (/(完成|做完|搞定|处理完|办完|结束|关掉)/.test(trimmed) && matchedNumber) {
+    return { action: "done", numbers: [matchedNumber] };
   }
 
-  if (/(详情|看看|看下|看一下|具体|上下文)/.test(trimmed) && numbers.length > 0) {
-    return { action: "detail", numbers: [numbers[0]] };
+  if (/(删掉|删除|去掉|移除|不要了)/.test(trimmed) && matchedNumber) {
+    return { action: "delete", numbers: [matchedNumber] };
+  }
+
+  if (/(详情|看看|看下|看一下|具体|上下文|这个任务|这个待办)/.test(trimmed) && matchedNumber) {
+    return { action: "detail", numbers: [matchedNumber] };
   }
 
   const addMatch = trimmed.match(/^(?:帮我|麻烦)?(?:记一下|记录一下|加一下|加一个待办|添加待办|新增待办|待办|提醒我|要处理|需要跟进|帮我跟进)\s*[：:]?\s*(.+)$/);
@@ -698,7 +775,7 @@ async function handleText(text: string, chatId?: string): Promise<string> {
     return addTodo(todoText);
   }
 
-  const fallbackIntent = parseNaturalFallback(trimmed);
+  const fallbackIntent = await parseNaturalFallback(trimmed);
 
   if (fallbackIntent) {
     const fallbackReply = await runNaturalIntent(fallbackIntent, chatId);
