@@ -1,10 +1,16 @@
 declare const EdgeRuntime: { waitUntil: (promise: Promise<unknown>) => void };
 
+type TodoNote = {
+  text: string;
+  createdAt: string;
+};
+
 type Todo = {
   text: string;
   done: boolean;
   createdAt: string;
   doneAt?: string;
+  notes?: TodoNote[];
 };
 
 function json(data: unknown, status = 200): Response {
@@ -86,6 +92,56 @@ async function deleteTodo(number: number): Promise<string> {
   return "已删除：" + todo.text;
 }
 
+async function addNote(number: number, text: string): Promise<string> {
+  const todos = await readTodos();
+  const openTodos = todos.filter((todo) => !todo.done);
+  const todo = openTodos[number - 1];
+
+  if (!todo) {
+    return "没有找到这个编号的待办";
+  }
+
+  if (!text.trim()) {
+    return "请写要补充的内容，比如：补充 1 这里是上下文";
+  }
+
+  todo.notes ||= [];
+  todo.notes.push({
+    text: text.trim(),
+    createdAt: new Date().toISOString(),
+  });
+
+  await writeTodos(todos);
+  return "已补充到第 " + number + " 条：" + todo.text;
+}
+
+async function formatTodoDetail(number: number): Promise<string> {
+  const todos = await readTodos();
+  const openTodos = todos.filter((todo) => !todo.done);
+  const todo = openTodos[number - 1];
+
+  if (!todo) {
+    return "没有找到这个编号的待办";
+  }
+
+  const lines = [
+    "待办详情：",
+    number + ". " + todo.text,
+  ];
+
+  if (!todo.notes || todo.notes.length === 0) {
+    lines.push("暂无补充上下文");
+    return lines.join("\n");
+  }
+
+  lines.push("上下文：");
+  todo.notes.forEach((note, index) => {
+    lines.push(index + 1 + ". " + note.text);
+  });
+
+  return lines.join("\n");
+}
+
 async function clearTodos(): Promise<string> {
   const todos = await readTodos();
 
@@ -121,6 +177,21 @@ async function handleText(text: string): Promise<string> {
     return deleteTodo(number);
   }
 
+  if (trimmed.startsWith("详情 ")) {
+    const number = Number(trimmed.replace("详情 ", ""));
+    return formatTodoDetail(number);
+  }
+
+  if (trimmed.startsWith("补充 ")) {
+    const match = trimmed.match(/^补充\s+(\d+)\s+([\s\S]+)$/);
+
+    if (!match) {
+      return "格式不对，请这样发：补充 1 这里是上下文";
+    }
+
+    return addNote(Number(match[1]), match[2]);
+  }
+
   if (trimmed.startsWith("添加 ")) {
     const todoText = trimmed.replace("添加 ", "");
     return addTodo(todoText);
@@ -132,6 +203,8 @@ async function handleText(text: string): Promise<string> {
     "列表",
     "完成 1",
     "删除 1",
+    "补充 1 上下文",
+    "详情 1",
     "清空",
   ].join("\n");
 }
