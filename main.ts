@@ -13,6 +13,11 @@ type Todo = {
   notes?: TodoNote[];
 };
 
+type PendingNote = {
+  numbers: number[];
+  createdAt: string;
+};
+
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
     status,
@@ -20,14 +25,72 @@ function json(data: unknown, status = 200): Response {
   });
 }
 
+function parseTodoNumbers(value: string): number[] {
+  return value
+    .split(/[，,、\s]+/)
+    .map((item) => Number(item.trim()))
+    .filter((item) => Number.isInteger(item) && item > 0);
+}
+
+function truncate(value: string, maxLength = 800): string {
+  if (value.length <= maxLength) {
+    return value;
+  }
+
+  return value.slice(0, maxLength) + "...";
+}
+
+function flattenPostContent(value: unknown): string[] {
+  if (!value) {
+    return [];
+  }
+
+  if (typeof value === "string") {
+    return [value];
+  }
+
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => flattenPostContent(item));
+  }
+
+  if (typeof value === "object") {
+    const item = value as Record<string, unknown>;
+    const texts: string[] = [];
+
+    if (typeof item.text === "string") {
+      texts.push(item.text);
+    }
+
+    if (typeof item.name === "string") {
+      texts.push(item.name);
+    }
+
+    if (typeof item.href === "string") {
+      texts.push(item.href);
+    }
+
+    if (item.content) {
+      texts.push(...flattenPostContent(item.content));
+    }
+
+    return texts;
+  }
+
+  return [];
+}
+
+async function getKv(): Promise<Deno.Kv> {
+  return Deno.openKv();
+}
+
 async function readTodos(): Promise<Todo[]> {
-  const kv = await Deno.openKv();
+  const kv = await getKv();
   const result = await kv.get<Todo[]>(["todos"]);
   return result.value || [];
 }
 
 async function writeTodos(todos: Todo[]): Promise<void> {
-  const kv = await Deno.openKv();
+  const kv = await getKv();
   await kv.set(["todos"], todos);
 }
 
@@ -92,27 +155,52 @@ async function deleteTodo(number: number): Promise<string> {
   return "已删除：" + todo.text;
 }
 
-async function addNote(number: number, text: string): Promise<string> {
-  const todos = await readTodos();
-  const openTodos = todos.filter((todo) => !todo.done);
-  const todo = openTodos[number - 1];
+async function addNotes(numbers: number[], text: string): Promise<string> {
+  const cleanText = text.trim();
 
-  if (!todo) {
-    return "没有找到这个编号的待办";
+  if (numbers.length === 0) {
+    return "请告诉我要补充到哪条待办，比如：补充 1 上下文";
   }
 
-  if (!text.trim()) {
+  if (!cleanText) {
     return "请写要补充的内容，比如：补充 1 这里是上下文";
   }
 
-  todo.notes ||= [];
-  todo.notes.push({
-    text: text.trim(),
-    createdAt: new Date().toISOString(),
+  const todos = await readTodos();
+  const openTodos = todos.filter((todo) => !todo.done);
+  const changed: string[] = [];
+  const missing: number[] = [];
+
+  numbers.forEach((number) => {
+    const todo = openTodos[number - 1];
+
+    if (!todo) {
+      missing.push(number);
+      return;
+    }
+
+    todo.notes ||= [];
+    todo.notes.push({
+      text: cleanText,
+      createdAt: new Date().toISOString(),
+    });
+
+    changed.push(number + ". " + todo.text);
   });
 
+  if (changed.length === 0) {
+    return "没有找到这些编号的待办：" + missing.join("、");
+  }
+
   await writeTodos(todos);
-  return "已补充到第 " + number + " 条：" + todo.text;
+
+  const lines = ["已补充到：", ...changed];
+
+  if (missing.length > 0) {
+    lines.push("未找到：" + missing.join("、"));
+  }
+
+  return lines.join("\n");
 }
 
 async function formatTodoDetail(number: number): Promise<string> {
@@ -156,7 +244,26 @@ async function clearTodos(): Promise<string> {
   return "已清空所有未完成待办";
 }
 
-async function handleText(text: string): Promise<string> {
+async function savePendingNote(chatId: string, numbers: number[]): Promise<void> {
+  const kv = await getKv();
+  await kv.set(["pending_note", chatId], {
+    numbers,
+    createdAt: new Date().toISOString(),
+  } satisfies PendingNote, { expireIn: 1000 * 60 * 15 });
+}
+
+async function getPendingNote(chatId: string): Promise<PendingNote | null> {
+  const kv = await getKv();
+  const result = await kv.get<PendingNote>(["pending_note", chatId]);
+  return result.value || null;
+}
+
+async function clearPendingNote(chatId: string): Promise<void> {
+  const kv = await getKv();
+  await kv.delete(["pending_note", chatId]);
+}
+
+async function handleText(text: string, chatId?: string): Promise<string> {
   const trimmed = text.trim();
 
   if (trimmed === "列表") {
@@ -165,6 +272,14 @@ async function handleText(text: string): Promise<string> {
 
   if (trimmed === "清空") {
     return clearTodos();
+  }
+
+  if (trimmed === "取消补充") {
+    if (chatId) {
+      await clearPendingNote(chatId);
+    }
+
+    return "已取消补充";
   }
 
   if (trimmed.startsWith("完成 ")) {
@@ -183,13 +298,25 @@ async function handleText(text: string): Promise<string> {
   }
 
   if (trimmed.startsWith("补充 ")) {
-    const match = trimmed.match(/^补充\s+(\d+)\s+([\s\S]+)$/);
+    const match = trimmed.match(/^补充\s+([\d，,、\s]+)(?:\s+([\s\S]+))?$/);
 
     if (!match) {
-      return "格式不对，请这样发：补充 1 这里是上下文";
+      return "格式不对，请这样发：补充 1 上下文，或补充 1,2";
     }
 
-    return addNote(Number(match[1]), match[2]);
+    const numbers = parseTodoNumbers(match[1]);
+    const note = match[2] || "";
+
+    if (note.trim()) {
+      return addNotes(numbers, note);
+    }
+
+    if (!chatId) {
+      return "请写要补充的内容，比如：补充 1 这里是上下文";
+    }
+
+    await savePendingNote(chatId, numbers);
+    return "好的，请把要补充的文字或聊天记录发给我。15 分钟内有效；如需取消，发送：取消补充";
   }
 
   if (trimmed.startsWith("添加 ")) {
@@ -204,7 +331,9 @@ async function handleText(text: string): Promise<string> {
     "完成 1",
     "删除 1",
     "补充 1 上下文",
+    "补充 1,2",
     "详情 1",
+    "取消补充",
     "清空",
   ].join("\n");
 }
@@ -220,6 +349,43 @@ function getTextFromFeishuMessage(message: any): string {
   } catch (_error) {
     return "";
   }
+}
+
+function summarizeFeishuMessage(message: any): string {
+  const messageId = message?.message_id || "未知 message_id";
+  const messageType = message?.message_type || "unknown";
+
+  try {
+    const content = JSON.parse(message?.content || "{}");
+
+    if (messageType === "text") {
+      return content.text || "";
+    }
+
+    if (messageType === "post") {
+      const title = content.title ? "标题：" + content.title + "\n" : "";
+      const text = flattenPostContent(content.content).join(" ").trim();
+      return title + (text || "收到一条富文本消息") + "\nmessage_id: " + messageId;
+    }
+
+    const raw = truncate(JSON.stringify(content));
+    return "收到一条「" + messageType + "」消息。\nmessage_id: " + messageId + "\n内容摘要：" + raw;
+  } catch (_error) {
+    return "收到一条「" + messageType + "」消息。\nmessage_id: " + messageId;
+  }
+}
+
+async function markMessageProcessed(messageId: string): Promise<boolean> {
+  const kv = await getKv();
+  const key = ["processed_message", messageId];
+  const existed = await kv.get<boolean>(key);
+
+  if (existed.value) {
+    return false;
+  }
+
+  await kv.set(key, true, { expireIn: 1000 * 60 * 60 * 24 });
+  return true;
 }
 
 async function getTenantAccessToken(): Promise<string | null> {
@@ -278,12 +444,12 @@ async function sendFeishuMessage(chatId: string, text: string): Promise<void> {
 }
 
 async function saveChatId(chatId: string): Promise<void> {
-  const kv = await Deno.openKv();
+  const kv = await getKv();
   await kv.set(["settings", "chatId"], chatId);
 }
 
 async function getSavedChatId(): Promise<string | null> {
-  const kv = await Deno.openKv();
+  const kv = await getKv();
   const result = await kv.get<string>(["settings", "chatId"]);
   return result.value || null;
 }
@@ -311,14 +477,43 @@ Deno.cron("evening-todo-reminder", "30 9 * * *", sendReminder);
 async function processFeishuMessage(body: any): Promise<void> {
   const message = body.event && body.event.message;
   const chatId = message && message.chat_id;
-  const text = getTextFromFeishuMessage(message);
+  const messageId = message && message.message_id;
 
-  if (!chatId || !text) {
+  if (!chatId || !messageId) {
+    return;
+  }
+
+  const shouldProcess = await markMessageProcessed(messageId);
+
+  if (!shouldProcess) {
     return;
   }
 
   await saveChatId(chatId);
-  const reply = await handleText(text);
+
+  const text = getTextFromFeishuMessage(message);
+  const pending = await getPendingNote(chatId);
+
+  if (text.trim() === "取消补充") {
+    const reply = await handleText(text, chatId);
+    await sendFeishuMessage(chatId, reply);
+    return;
+  }
+
+  if (pending) {
+    const note = summarizeFeishuMessage(message);
+    const reply = await addNotes(pending.numbers, note);
+    await clearPendingNote(chatId);
+    await sendFeishuMessage(chatId, reply);
+    return;
+  }
+
+  if (!text) {
+    await sendFeishuMessage(chatId, "如果要把这条消息作为上下文，请先发送：补充 1，然后再转发/发送内容给我");
+    return;
+  }
+
+  const reply = await handleText(text, chatId);
   await sendFeishuMessage(chatId, reply);
 }
 
