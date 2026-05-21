@@ -795,6 +795,44 @@ async function findTodoNumberByText(text: string): Promise<number | null> {
   return bestScore >= 2 ? bestNumber : null;
 }
 
+async function resolveImplicitTodoNumber(chatId: string | undefined, text: string): Promise<number | null> {
+  const lastTodo = await getLastTodoContext(chatId);
+
+  if (lastTodo) {
+    return lastTodo.number;
+  }
+
+  const matchedNumber = await findTodoNumberByText(text);
+
+  if (matchedNumber) {
+    return matchedNumber;
+  }
+
+  const todos = await readTodos();
+  const openTodos = todos.filter((todo) => !todo.done);
+
+  if (openTodos.length === 1) {
+    return 1;
+  }
+
+  return null;
+}
+
+async function askWhichTodoForFollowUp(): Promise<string> {
+  const todos = await readTodos();
+  const openTodos = todos.filter((todo) => !todo.done);
+
+  if (openTodos.length === 0) {
+    return "目前没有待办可以整理。";
+  }
+
+  return [
+    "你想整理哪一条待办？",
+    ...openTodos.map((todo, index) => index + 1 + ". " + todo.text),
+    "可以直接回复：第 1 条用表格",
+  ].join("\n");
+}
+
 async function parseNaturalFallback(text: string): Promise<NaturalIntent | null> {
   const trimmed = text.trim();
   const numbers = findTodoNumbersInText(trimmed);
@@ -851,14 +889,17 @@ async function parseNaturalFallback(text: string): Promise<NaturalIntent | null>
 
 async function handleText(text: string, chatId?: string): Promise<string> {
   const trimmed = text.trim();
+  const isFollowUpRequest = /(表格|表|简单|白话|简短|短一点|一句话|行动项|下一步|怎么做|待确认|换个格式|重新整理|这个任务|这个待办)/.test(trimmed);
 
-  const lastTodo = await getLastTodoContext(chatId);
-  if (
-    lastTodo &&
-    /(表格|表|简单|白话|简短|短一点|一句话|行动项|下一步|怎么做|待确认|换个格式|重新整理|这个任务|这个待办)/.test(trimmed)
-  ) {
-    await saveLastTodoContext(chatId, lastTodo.number);
-    return answerTodoFollowUp(lastTodo.number, trimmed);
+  if (isFollowUpRequest) {
+    const todoNumber = await resolveImplicitTodoNumber(chatId, trimmed);
+
+    if (!todoNumber) {
+      return askWhichTodoForFollowUp();
+    }
+
+    await saveLastTodoContext(chatId, todoNumber);
+    return answerTodoFollowUp(todoNumber, trimmed);
   }
 
   if (trimmed === "列表") {
