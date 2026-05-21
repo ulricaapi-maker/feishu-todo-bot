@@ -437,6 +437,9 @@ async function interpretNaturalText(text: string): Promise<NaturalIntent | null>
   const apiKey = Deno.env.get("OPENAI_API_KEY");
 
   if (!apiKey || !text.trim()) {
+    if (!apiKey) {
+      console.log("AI 意图解析未启用：缺少 OPENAI_API_KEY");
+    }
     return null;
   }
 
@@ -485,7 +488,13 @@ async function interpretNaturalText(text: string): Promise<NaturalIntent | null>
     ?.join("\n")
     ?.trim();
 
-  return outputText ? extractJsonObject(outputText) : null;
+  const intent = outputText ? extractJsonObject(outputText) : null;
+
+  if (!intent) {
+    console.log("AI 意图解析没有返回可用 JSON：", outputText || data);
+  }
+
+  return intent;
 }
 
 async function runNaturalIntent(intent: NaturalIntent, chatId?: string): Promise<string | null> {
@@ -531,7 +540,7 @@ async function runNaturalIntent(intent: NaturalIntent, chatId?: string): Promise
 }
 
 function parseChineseNumber(value: string): number | null {
-  const normalized = value.trim();
+  const normalized = value.trim().replace(/^第/, "").replace(/[个条项号]$/, "");
   const digit = normalized.match(/\d+/);
 
   if (digit) {
@@ -555,10 +564,22 @@ function parseChineseNumber(value: string): number | null {
   return map[normalized] || null;
 }
 
+function findTodoNumbersInText(text: string): number[] {
+  const matches = text.match(/第?\s*[\d一二两三四五六七八九十]+\s*(?:个|条|项|号)?/g) || [];
+  return matches
+    .map((item) => parseChineseNumber(item))
+    .filter((item): item is number => Boolean(item));
+}
+
 function parseNaturalFallback(text: string): NaturalIntent | null {
   const trimmed = text.trim();
+  const numbers = findTodoNumbersInText(trimmed);
 
-  if (/^(看一下)?(待办)?(列表|清单)$/.test(trimmed) || /还有(哪些|什么).*待办/.test(trimmed)) {
+  if (
+    /^(看一下|看下)?(待办)?(列表|清单)$/.test(trimmed) ||
+    /(还有|剩下).*(哪些|什么|啥).*待办/.test(trimmed) ||
+    /(待办|任务).*(有哪些|是什么|给我看看)/.test(trimmed)
+  ) {
     return { action: "list" };
   }
 
@@ -566,32 +587,34 @@ function parseNaturalFallback(text: string): NaturalIntent | null {
     return { action: "cancel_note" };
   }
 
-  const noteMatch = trimmed.match(/(?:补充|作为上下文|聊天记录|下一条|后面).*(?:第?\s*([\d一二两三四五六七八九十，,、\s]+)\s*(?:条|个)?)/);
-  if (noteMatch) {
-    return { action: "start_note", numbers: parseTodoNumbers(noteMatch[1]) };
+  if (/(补充|上下文|聊天记录|对话|下一条|后面|转发)/.test(trimmed) && numbers.length > 0) {
+    return { action: "start_note", numbers };
   }
 
-  const doneMatch = trimmed.match(/(?:第?\s*([\d一二两三四五六七八九十]+)\s*(?:条|个)?).*(?:完成|做完|搞定|处理完)/);
-  if (doneMatch) {
-    const number = parseChineseNumber(doneMatch[1]);
-    return number ? { action: "done", numbers: [number] } : null;
+  if (/(完成|做完|搞定|处理完|办完|结束|关掉)/.test(trimmed) && numbers.length > 0) {
+    return { action: "done", numbers: [numbers[0]] };
   }
 
-  const deleteMatch = trimmed.match(/(?:删掉|删除|去掉).*(?:第?\s*([\d一二两三四五六七八九十]+)\s*(?:条|个)?)/);
-  if (deleteMatch) {
-    const number = parseChineseNumber(deleteMatch[1]);
-    return number ? { action: "delete", numbers: [number] } : null;
+  if (/(删掉|删除|去掉|移除|不要了)/.test(trimmed) && numbers.length > 0) {
+    return { action: "delete", numbers: [numbers[0]] };
   }
 
-  const detailMatch = trimmed.match(/(?:详情|看看|看下|看一下).*(?:第?\s*([\d一二两三四五六七八九十]+)\s*(?:条|个)?)/);
-  if (detailMatch) {
-    const number = parseChineseNumber(detailMatch[1]);
-    return number ? { action: "detail", numbers: [number] } : null;
+  if (/(详情|看看|看下|看一下|具体|上下文)/.test(trimmed) && numbers.length > 0) {
+    return { action: "detail", numbers: [numbers[0]] };
   }
 
-  const addMatch = trimmed.match(/^(?:帮我)?(?:记一下|记录一下|加一个待办|添加待办|待办|提醒我|要处理|需要跟进)\s*[：:]?\s*(.+)$/);
+  const addMatch = trimmed.match(/^(?:帮我|麻烦)?(?:记一下|记录一下|加一下|加一个待办|添加待办|新增待办|待办|提醒我|要处理|需要跟进|帮我跟进)\s*[：:]?\s*(.+)$/);
   if (addMatch?.[1]?.trim()) {
     return { action: "add", text: addMatch[1].trim() };
+  }
+
+  if (
+    trimmed.length >= 4 &&
+    trimmed.length <= 80 &&
+    !/[?？]/.test(trimmed) &&
+    /(确认|跟进|处理|检查|看看|对齐|整理|回复|补充|评审|核对)/.test(trimmed)
+  ) {
+    return { action: "add", text: trimmed };
   }
 
   return null;
