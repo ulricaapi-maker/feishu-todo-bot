@@ -16,6 +16,12 @@ type PendingNote = {
   createdAt: string;
 };
 
+type LastTodoContext = {
+  number: number;
+  title: string;
+  updatedAt: string;
+};
+
 const FORWARD_MESSAGE_TYPES = ["merge_forward", "forward", "chat_history"];
 
 function json(data: unknown, status = 200): Response {
@@ -437,6 +443,78 @@ async function formatTodoDetail(number: number): Promise<string> {
   return lines.join("\n");
 }
 
+async function answerTodoFollowUp(number: number, request: string): Promise<string> {
+  const todos = await readTodos();
+  const openTodos = todos.filter((todo) => !todo.done);
+  const todo = openTodos[number - 1];
+
+  if (!todo) {
+    return "没有找到这个编号的待办";
+  }
+
+  const noteText = todo.notes
+    ?.map((note, index) => index + 1 + ". " + cleanUserVisibleText(note.text))
+    .filter((line) => line.trim() && !line.endsWith(". "))
+    .join("\n") || "";
+
+  if (!noteText.trim()) {
+    return "这个待办还没有补充上下文，我只能看到标题：" + todo.text;
+  }
+
+  const wantsTable = /(表格|表|table)/i.test(request);
+  const wantsActions = /(行动项|下一步|怎么做|待办项|todo)/i.test(request);
+  const wantsSimple = /(简单|白话|简短|短一点|一句话)/i.test(request);
+
+  const systemPrompt = [
+    "你是飞书待办助手，请根据待办标题和上下文回答用户追问。",
+    "不要输出技术字段，不要提 message_id，不要提 open_id。",
+    "如果用户要表格，用 Markdown 表格。",
+    "如果用户要下一步或行动项，输出清晰的行动项。",
+    "如果上下文很少，要明确说明哪些是推断。",
+  ].join("\n");
+
+  const styleHint = wantsTable
+    ? "请用 Markdown 表格输出，列建议包含：序号、事项、已知信息、待确认、下一步。"
+    : wantsActions
+      ? "请输出行动项清单，包含负责人/待确认点/下一步。"
+      : wantsSimple
+        ? "请用非常简短的白话总结。"
+        : "请自然回答用户问题。";
+
+  const answer = await callAI(
+    systemPrompt,
+    [
+      "用户追问：" + request,
+      styleHint,
+      "",
+      "待办标题：" + todo.text,
+      "",
+      "上下文：",
+      noteText,
+    ].join("\n"),
+  );
+
+  if (answer) {
+    return answer;
+  }
+
+  if (wantsTable) {
+    return [
+      "| 序号 | 信息 | 内容 |",
+      "|---|---|---|",
+      "| 1 | 待办 | " + todo.text + " |",
+      "| 2 | 已知信息 | " + truncate(noteText.replace(/\n+/g, "；"), 120) + " |",
+      "| 3 | 待确认 | 需要进一步确认归属/环境/处理人 |",
+      "| 4 | 下一步 | 根据上下文继续跟进确认 |",
+    ].join("\n");
+  }
+
+  return [
+    "我先按现有上下文整理：",
+    noteText,
+  ].join("\n");
+}
+
 async function summarizeTodo(number: number): Promise<string> {
   const todos = await readTodos();
   const openTodos = todos.filter((todo) => !todo.done);
@@ -502,6 +580,37 @@ async function getPendingNote(chatId: string): Promise<PendingNote | null> {
 async function clearPendingNote(chatId: string): Promise<void> {
   const kv = await getKv();
   await kv.delete(["pending_note", chatId]);
+}
+
+async function saveLastTodoContext(chatId: string | undefined, number: number): Promise<void> {
+  if (!chatId) {
+    return;
+  }
+
+  const todos = await readTodos();
+  const openTodos = todos.filter((todo) => !todo.done);
+  const todo = openTodos[number - 1];
+
+  if (!todo) {
+    return;
+  }
+
+  const kv = await getKv();
+  await kv.set(["last_todo", chatId], {
+    number,
+    title: todo.text,
+    updatedAt: new Date().toISOString(),
+  } satisfies LastTodoContext, { expireIn: 1000 * 60 * 60 * 2 });
+}
+
+async function getLastTodoContext(chatId: string | undefined): Promise<LastTodoContext | null> {
+  if (!chatId) {
+    return null;
+  }
+
+  const kv = await getKv();
+  const result = await kv.get<LastTodoContext>(["last_todo", chatId]);
+  return result.value || null;
 }
 
 type NaturalIntent = {
@@ -596,15 +705,18 @@ async function runNaturalIntent(intent: NaturalIntent, chatId?: string): Promise
   }
 
   if (intent.action === "detail" && firstNumber) {
+    await saveLastTodoContext(chatId, firstNumber);
     return formatTodoDetail(firstNumber);
   }
 
   if (intent.action === "summarize" && firstNumber) {
+    await saveLastTodoContext(chatId, firstNumber);
     return summarizeTodo(firstNumber);
   }
 
   if (intent.action === "start_note" && intent.numbers?.length && chatId) {
     await savePendingNote(chatId, intent.numbers);
+    await saveLastTodoContext(chatId, intent.numbers[0]);
     return "好的，请把要补充的文字或聊天记录发给我。15 分钟内有效；如需取消，发送：取消补充";
   }
 
@@ -740,6 +852,15 @@ async function parseNaturalFallback(text: string): Promise<NaturalIntent | null>
 async function handleText(text: string, chatId?: string): Promise<string> {
   const trimmed = text.trim();
 
+  const lastTodo = await getLastTodoContext(chatId);
+  if (
+    lastTodo &&
+    /(表格|表|简单|白话|简短|短一点|一句话|行动项|下一步|怎么做|待确认|换个格式|重新整理|这个任务|这个待办)/.test(trimmed)
+  ) {
+    await saveLastTodoContext(chatId, lastTodo.number);
+    return answerTodoFollowUp(lastTodo.number, trimmed);
+  }
+
   if (trimmed === "列表") {
     return formatTodoList();
   }
@@ -768,6 +889,7 @@ async function handleText(text: string, chatId?: string): Promise<string> {
 
   if (trimmed.startsWith("详情 ")) {
     const number = Number(trimmed.replace("详情 ", ""));
+    await saveLastTodoContext(chatId, number);
     return formatTodoDetail(number);
   }
 
@@ -782,6 +904,7 @@ async function handleText(text: string, chatId?: string): Promise<string> {
     const note = match[2] || "";
 
     if (note.trim()) {
+      await saveLastTodoContext(chatId, numbers[0]);
       return addNotes(numbers, note);
     }
 
@@ -790,6 +913,7 @@ async function handleText(text: string, chatId?: string): Promise<string> {
     }
 
     await savePendingNote(chatId, numbers);
+    await saveLastTodoContext(chatId, numbers[0]);
     return "好的，请把要补充的文字或聊天记录发给我。15 分钟内有效；如需取消，发送：取消补充";
   }
 
@@ -1096,6 +1220,7 @@ async function processFeishuMessage(body: any): Promise<void> {
     const note = await summarizeFeishuMessage(message);
     const reply = await addNotes(pending.numbers, note);
     await clearPendingNote(chatId);
+    await saveLastTodoContext(chatId, pending.numbers[0]);
     await sendFeishuMessage(chatId, reply);
     return;
   }
